@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import React from 'react';
 
 // ============================================================
 // CONFIG
@@ -6,7 +7,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 // In development: http://localhost:3001
 // In production:  https://your-backend-domain.com
 // ============================================================
-const API_BASE = process.env.REACT_APP_API_BASE || import.meta.env.VITE_API_BASE || "http://localhost:3001";
+const API_BASE = "http://localhost:3001";
 
 // ============================================================
 // MODULE 1: Schema Registry (now DYNAMIC)
@@ -44,61 +45,32 @@ function buildSchemaPrompt(schema, database) {
 }
 
 // ============================================================
-// MODULE 3: SQL Generator — calls Claude API
-// Unchanged in logic; now passes PostgreSQL dialect hint
-// and the live schema prompt instead of the static one.
+// MODULE 3: SQL Generator — Points to secure Backend Proxy
 // ============================================================
-
 async function generateSQL(question, schemaPrompt) {
-  const systemPrompt = `You are an expert PostgreSQL query generator. Given a database schema and a natural language question, produce a single valid SQL SELECT query.
-
-Rules:
-- Output ONLY valid SQL — no markdown, no explanation, no backticks
-- Use standard PostgreSQL syntax
-- Use table aliases for clarity when joining
-- Add helpful SQL comments with -- to explain complex parts
-- Never use DROP, DELETE, UPDATE, INSERT or any DDL/DML
-- If the question is ambiguous, make a reasonable assumption
-- Always add ORDER BY and LIMIT when appropriate for top/recent queries
-- Use double quotes for table/column names that might be reserved words
-
-${schemaPrompt}`;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("http://localhost:3001/generate-sql", { // No /api/
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: [{ role: "user", content: `Question: ${question}` }]
-    })
+    body: JSON.stringify({ question, schemaPrompt })
   });
-
   const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.content.map(b => b.text || "").join("").trim();
+  if (data.error) throw new Error(data.error);
+  return data.sql;
 }
 
 // ============================================================
-// MODULE 4: SQL Explainer — calls Claude API
-// Identical to the original — no changes needed.
+// MODULE 4: SQL Explainer — Points to secure Backend Proxy
 // ============================================================
-
+// Inside explainSQL:
 async function explainSQL(sql, question) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("http://localhost:3001/explain-sql", { // No /api/
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 400,
-      system: `You explain SQL queries in plain English for non-technical users. Be concise (2-4 sentences). Explain what data is being retrieved and any filters/aggregations applied. No code formatting.`,
-      messages: [{ role: "user", content: `Original question: "${question}"\n\nSQL:\n${sql}\n\nExplain this query in simple terms.` }]
-    })
+    body: JSON.stringify({ sql, question })
   });
   const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.content.map(b => b.text || "").join("").trim();
+  if (data.error) throw new Error(data.error);
+  return data.explanation;
 }
 
 // ============================================================

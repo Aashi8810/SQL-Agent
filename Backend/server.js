@@ -9,6 +9,7 @@ const { Pool } = require("pg");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -198,43 +199,110 @@ app.get("/schema", async (req, res) => {
 });
 
 // ============================================================
-// ROUTE: POST /query
-// Validates and executes a SELECT query, returns results
-// Replaces Module 5 (SQL Engine) and Module 7 (Query Executor)
+// ROUTE: POST /generate-sql (No /api prefix, uses Axios)
 // ============================================================
-
-app.post("/query", async (req, res) => {
-  const { sql } = req.body;
-
-  // 1. Validate
-  const { valid, reason } = validateSQL(sql);
-  if (!valid) {
-    return res.status(403).json({ error: reason });
-  }
-
-  // 2. Enforce row cap
-  const safeSql = enforceLimitCap(sql, 1000);
-
-  // 3. Execute
-  const start = Date.now();
+app.post("/generate-sql", async (req, res) => {
   try {
-    const result = await pool.query(safeSql);
-    const duration = Date.now() - start;
+    const { question, schemaPrompt } = req.body;
 
-    // Normalize rows to array-of-arrays (matches the shape sql.js returned)
-    const columns = result.fields.map(f => f.name);
-    const rows = result.rows.map(row => columns.map(col => row[col]));
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({ error: "Backend missing GROQ_API_KEY configuration." });
+    }
 
-    res.json({
+    const systemPrompt = `You are an expert PostgreSQL query generator. Given a database schema and a natural language question, produce a single valid SQL SELECT query.\nRules:\n- Output ONLY valid SQL — no markdown, no explanation, no backticks\n- Use standard PostgreSQL syntax\n- Use table aliases for clarity when joining\n- Never use DROP, DELETE, UPDATE, INSERT or any DDL/DML\n- Always add ORDER BY and LIMIT when appropriate\n\n${schemaPrompt}`;
+
+    const response = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama-3.1-8b-instant", // Active supported model
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Question: ${question}` }
+      ],
+      temperature: 0.1
+    }, {
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+      }
+    });
+
+    const sqlOutput = response.data.choices[0].message.content.replace(/```sql|```/g, "").trim();
+    return res.json({ sql: sqlOutput });
+
+  } catch (err) {
+    console.error("Backend SQL generation error:", err.message);
+    return res.status(500).json({ error: err.response?.data?.error?.message || "SQL generation failed." });
+  }
+});
+
+// ============================================================
+// ROUTE: POST /explain-sql (No /api prefix, uses Axios)
+// ============================================================
+app.post("/explain-sql", async (req, res) => {
+  try {
+    const { sql, question } = req.body;
+
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({ error: "Backend missing GROQ_API_KEY configuration." });
+    }
+
+    const response = await axios.post("https://api.groq.com/openai/v1/chat/completions", {
+      model: "llama-3.1-8b-instant", // Active supported model
+      messages: [
+        { role: "system", content: "You explain SQL queries in plain English for non-technical users. Be concise (2-4 sentences). Explain what data is being retrieved and any filters/aggregations applied. No code formatting." },
+        { role: "user", content: `Original question: "${question}"\n\nSQL:\n${sql}\n\nExplain this query in simple terms.` }
+      ]
+    }, {
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+      }
+    });
+
+    return res.json({ explanation: response.data.choices[0].message.content.trim() });
+  } catch (err) {
+    console.error("Backend Explanation error:", err.message);
+    return res.status(500).json({ error: err.response?.data?.error?.message || "Explanation failed on backend." });
+  }
+});
+
+
+// ============================================================
+// ROUTE: POST /query
+// Validates and executes a SQL query against PostgreSQL
+// ============================================================
+app.post("/query", async (req, res) => {
+  try {
+    const { sql } = req.body;
+
+    // 1. Run safety validation checks
+    const validation = validateSQL(sql);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.reason });
+    }
+
+    // 2. Enforce a row limit cap automatically if none exists
+    const finalSql = enforceLimitCap(sql);
+
+    // 3. Track performance duration and run the query
+    const startTime = Date.now();
+    const dbResult = await pool.query(finalSql);
+    const durationMs = Date.now() - startTime;
+
+    // 4. Format the columns and rows into a matrix matching the frontend's expected format
+    const columns = dbResult.fields.map(f => f.name);
+    const rows = dbResult.rows.map(row => columns.map(col => row[col]));
+
+    // 5. Send back structured database info
+    return res.json({
       columns,
       rows,
-      rowCount: result.rowCount,
-      durationMs: duration
+      rowCount: dbResult.rowCount,
+      durationMs
     });
 
   } catch (err) {
-    console.error("Query execution error:", err.message);
-    res.status(400).json({ error: "SQL Error: " + err.message });
+    console.error("Database execution error:", err.message);
+    return res.status(500).json({ error: "Database error: " + err.message });
   }
 });
 
